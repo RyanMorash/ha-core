@@ -41,6 +41,17 @@
       }
     }
   },
+  "exceptions": {
+    "authentication_failed": {
+      "message": "Jellyfin authentication failed"
+    },
+    "request_failed": {
+      "message": "Jellyfin request failed with status {status}"
+    },
+    "server_unreachable": {
+      "message": "Jellyfin server is unreachable"
+    }
+  },
   "options": {
     "step": {
       "init": {

@@ -1,19 +1,31 @@
 """Tests for the Jellyfin integration."""
 
+from datetime import timedelta
+import logging
 from unittest.mock import MagicMock
 
-from pytest_homeassistant.common import MockConfigEntry
+from freezegun.api import FrozenDateTimeFactory
+from jellyfin_apiclient_python.exceptions import HTTPException
+import pytest
+from pytest_homeassistant.common import MockConfigEntry, async_fire_time_changed
 from pytest_homeassistant.typing import WebSocketGenerator
+from requests.exceptions import ConnectionError as RequestsConnectionError
 
 from homeassistant.components.jellyfin.const import DOMAIN
 from homeassistant.config_entries import SOURCE_REAUTH, ConfigEntryState
 from homeassistant.const import CONF_PASSWORD, CONF_URL, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.update_coordinator import (
+    UpdateFailed,
+    UpdateFailedUnreachable,
+)
 from homeassistant.setup import async_setup_component
 
 from . import async_load_json_fixture
 from .const import TEST_PASSWORD, TEST_URL, TEST_USERNAME
+
+UPDATE_INTERVAL = timedelta(seconds=10)
 
 
 async def test_config_entry_not_ready(
@@ -102,6 +114,85 @@ async def test_migrate_strips_trailing_slash_from_url(
 
     assert config_entry.minor_version == 2
     assert config_entry.data[CONF_URL] == TEST_URL
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_exception", "log_level"),
+    [
+        pytest.param(
+            "ServerUnreachable",
+            UpdateFailedUnreachable,
+            logging.INFO,
+            id="server-unreachable",
+        ),
+        pytest.param(
+            "ReadTimeout",
+            UpdateFailedUnreachable,
+            logging.INFO,
+            id="read-timeout",
+        ),
+        pytest.param(503, UpdateFailed, logging.ERROR, id="http-status"),
+    ],
+)
+async def test_update_http_exception_does_not_log_traceback(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_jellyfin: MagicMock,
+    mock_client: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+    freezer: FrozenDateTimeFactory,
+    status: str | int,
+    expected_exception: type[Exception],
+    log_level: int,
+) -> None:
+    """Known Jellyfin HTTP failures update availability without a stack trace."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    mock_client.jellyfin.sessions.side_effect = HTTPException(
+        status, RequestsConnectionError("server down")
+    )
+    caplog.clear()
+    freezer.tick(UPDATE_INTERVAL)
+    with caplog.at_level(logging.INFO, logger="homeassistant.components.jellyfin"):
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done()
+
+    assert type(mock_config_entry.runtime_data.last_exception) is expected_exception
+    assert mock_config_entry.runtime_data.last_update_success is False
+    assert "Unexpected error fetching jellyfin data" not in caplog.text
+    assert "Traceback (most recent call last)" not in caplog.text
+    assert any(record.levelno == log_level for record in caplog.records)
+
+
+async def test_update_unauthorized_starts_reauth(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_jellyfin: MagicMock,
+    mock_client: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """An unauthorized Jellyfin response starts reauth without a stack trace."""
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    mock_client.jellyfin.sessions.side_effect = HTTPException(
+        "Unauthorized", RequestsConnectionError("401")
+    )
+    caplog.clear()
+    freezer.tick(UPDATE_INTERVAL)
+    with caplog.at_level(logging.INFO, logger="homeassistant.components.jellyfin"):
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done()
+
+    flows = hass.config_entries.flow.async_progress()
+    assert len(flows) == 1
+    assert flows[0]["context"]["source"] == SOURCE_REAUTH
+    assert "Unexpected error fetching jellyfin data" not in caplog.text
+    assert "Traceback (most recent call last)" not in caplog.text
 
 
 async def test_device_remove_devices(
