@@ -5,6 +5,7 @@ import logging
 from random import randrange
 from typing import Any, cast, override
 
+import aiohttp
 from pyatv import connect, exceptions, scan
 from pyatv.conf import AppleTV
 from pyatv.const import DeviceModel, Protocol
@@ -45,6 +46,17 @@ DEFAULT_NAME_HP = "HomePod"
 
 BACKOFF_TIME_LOWER_LIMIT = 15  # seconds
 BACKOFF_TIME_UPPER_LIMIT = 300  # Five minutes
+
+# Failures while the reconnect loop is waiting for a device to come back.
+_RECONNECT_ERRORS = (
+    aiohttp.ClientError,
+    exceptions.BackOffError,
+    exceptions.ConnectionFailedError,
+    exceptions.ConnectionLostError,
+    exceptions.OperationTimeoutError,
+    exceptions.ProtocolError,
+    OSError,
+)
 
 PLATFORMS = [Platform.BINARY_SENSOR, Platform.MEDIA_PLAYER, Platform.REMOTE]
 
@@ -227,13 +239,19 @@ class AppleTVManager(DeviceListener):
         except exceptions.AuthenticationError:
             self.config_entry.async_start_reauth(self.hass)
             await self.disconnect()
-            _LOGGER.exception(
+            _LOGGER.error(
                 "Authentication failed for %s, try reconfiguring device",
                 self.config_entry.data[CONF_NAME],
             )
             return
         except asyncio.CancelledError:
             pass
+        except _RECONNECT_ERRORS as err:
+            _LOGGER.debug(
+                "Failed to connect to %s: %s",
+                self.config_entry.data[CONF_NAME],
+                err,
+            )
         except Exception:
             _LOGGER.exception("Failed to connect")
 
